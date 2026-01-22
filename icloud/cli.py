@@ -345,18 +345,18 @@ def resolve(ctx, strategy, file):
     
     \b
     Examples:
-      icloud resolve                     # Resolve all conflicts (auto)
+      icloud resolve                     # Resolve all conflicts (keep local)
       icloud resolve -s local            # Keep local version for all
-      icloud resolve -s remote           # Keep remote version for all
+      icloud resolve -s remote           # Re-download remote version for all
       icloud resolve -f doc.txt          # Resolve specific file
       icloud resolve -f doc.txt -s local # Keep local for specific file
     
     \b
     Strategies:
-      auto   - Automatically choose based on timestamps
+      auto   - Keep local version (safer, preserves your changes)
       local  - Keep local version, discard remote
-      remote - Keep remote version, discard local
-      merge  - Attempt to merge (for text files)
+      remote - Re-download remote version from iCloud (creates backup)
+      merge  - Show guidance for manual merge
     """
     config = ctx.obj['config']
     state = ctx.obj['state']
@@ -368,6 +368,19 @@ def resolve(ctx, strategy, file):
         click.echo("No conflicts to resolve.")
         return
     
+    # Get sync_manager for 'remote' strategy (needs to download files)
+    sync_manager = None
+    if strategy == 'remote':
+        auth = AuthManager(config)
+        if not auth.is_authenticated():
+            click.echo("Not authenticated. Please run 'icloud login' first.", err=True)
+            sys.exit(1)
+        service = auth.get_service()
+        if not service:
+            click.echo("Failed to get iCloud service.", err=True)
+            sys.exit(1)
+        sync_manager = SyncManager(service, state, config)
+    
     if file:
         # Resolve specific file
         file_path = Path.cwd() / file
@@ -375,7 +388,7 @@ def resolve(ctx, strategy, file):
             click.echo(f"File {file} is not in conflict.", err=True)
             sys.exit(1)
         
-        if resolver.resolve_conflict(file_path, strategy):
+        if resolver.resolve_conflict(file_path, strategy, sync_manager):
             click.echo(f"Resolved conflict for {file}.")
         else:
             click.echo(f"Failed to resolve conflict for {file}.", err=True)
@@ -385,16 +398,16 @@ def resolve(ctx, strategy, file):
         resolved = 0
         failed = 0
         
+        click.echo(f"Resolving {len(conflicts)} conflict(s) with strategy: {strategy}")
+        
         for rel_path in list(conflicts.keys()):
             file_path = Path.cwd() / rel_path
-            if resolver.resolve_conflict(file_path, strategy):
+            if resolver.resolve_conflict(file_path, strategy, sync_manager):
                 resolved += 1
-                click.echo(f"Resolved: {rel_path}")
             else:
                 failed += 1
-                click.echo(f"Failed to resolve: {rel_path}", err=True)
         
-        click.echo(f"Resolved {resolved} conflict(s).")
+        click.echo(f"\nResolved {resolved} conflict(s).")
         if failed > 0:
             click.echo(f"Failed to resolve {failed} conflict(s).", err=True)
 

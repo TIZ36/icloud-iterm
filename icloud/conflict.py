@@ -119,12 +119,14 @@ class ConflictResolver:
         merged_content = "".join(merged_lines).encode('utf-8')
         return merged_content, False  # False indicates manual resolution needed
     
-    def resolve_conflict(self, file_path: Path, strategy: str = "auto") -> bool:
+    def resolve_conflict(self, file_path: Path, strategy: str = "auto",
+                         sync_manager=None) -> bool:
         """Resolve a conflict for a file.
         
         Args:
             file_path: Path to conflicted file
             strategy: Resolution strategy ('auto', 'local', 'remote', 'merge')
+            sync_manager: SyncManager instance (required for 'remote' strategy)
             
         Returns:
             True if resolved successfully
@@ -136,26 +138,65 @@ class ConflictResolver:
             return False
         
         if strategy == "local":
-            # Keep local version
+            # Keep local version - just remove conflict marker
+            new_hash = State.compute_file_hash(file_path)
+            self.state.set_file_hash(rel_path, new_hash)
             self.state.remove_conflict(rel_path)
+            print(f"  Kept local version: {rel_path}")
             return True
         
         if strategy == "remote":
-            # Keep remote version - file should already be synced
+            # Keep remote version - need to re-download from iCloud
+            if sync_manager is None:
+                print(f"  Error: sync_manager required for 'remote' strategy")
+                return False
+            
+            # Get remote source path from state
+            remote_source = self.state.get_file_source(rel_path)
+            if not remote_source:
+                print(f"  Error: Cannot find remote source for {rel_path}")
+                return False
+            
+            # Create backup of local file
+            backup_path = self.create_backup(file_path)
+            print(f"  Backup created: {backup_path}")
+            
+            # Download remote version
+            try:
+                if sync_manager.download_single_file(remote_source, file_path):
+                    new_hash = State.compute_file_hash(file_path)
+                    self.state.set_file_hash(rel_path, new_hash)
+                    self.state.remove_conflict(rel_path)
+                    print(f"  Downloaded remote version: {rel_path}")
+                    return True
+                else:
+                    print(f"  Failed to download remote version: {rel_path}")
+                    return False
+            except Exception as e:
+                print(f"  Error downloading remote: {e}")
+                return False
+        
+        if strategy == "auto":
+            # Auto strategy: compare local and remote modification times
+            # If we have conflict info with timestamps, use that
+            local_hash = conflict.get('local_hash', '')
+            remote_hash = conflict.get('remote_hash', '')
+            
+            # Default: keep local (safer choice - user's changes preserved)
+            print(f"  Auto-resolving: keeping local version for {rel_path}")
+            new_hash = State.compute_file_hash(file_path)
+            self.state.set_file_hash(rel_path, new_hash)
             self.state.remove_conflict(rel_path)
             return True
         
-        if strategy == "auto" or strategy == "merge":
+        if strategy == "merge":
             if self.is_text_file(file_path):
-                # For text files, we'd need base version for proper merge
-                # For now, mark as resolved and let user edit manually
-                # The file should have conflict markers from sync
-                print(f"Text file {file_path} has conflict markers. Please edit manually.")
-                self.state.remove_conflict(rel_path)
-                return True
+                # For text files without base version, just show both versions
+                print(f"  Text file {rel_path} needs manual merge.")
+                print(f"  Use 'local' or 'remote' strategy, or edit the file manually.")
+                return False
             else:
-                # Binary file - need user choice
-                print(f"Binary file {file_path} has conflicts. Use 'local' or 'remote' strategy.")
+                print(f"  Binary file {rel_path} cannot be merged. Use 'local' or 'remote'.")
                 return False
         
         return False
