@@ -45,11 +45,39 @@ class SyncManager:
         self.resolver = ConflictResolver(state)
         self.max_workers = max_workers
         self._state_lock = threading.Lock()  # Thread-safe state updates
+        self._cache_lock = threading.Lock()  # Thread-safe cache access
+        self._folder_cache: Dict[str, List] = {}  # Cache for folder contents
         self.exclude_patterns = exclude_patterns if exclude_patterns is not None else DEFAULT_EXCLUDE_PATTERNS
         self.max_depth = max_depth
         
         if hasattr(service, 'drive'):
             self.drive = service.drive
+    
+    def clear_cache(self):
+        """Clear the folder contents cache."""
+        with self._cache_lock:
+            self._folder_cache.clear()
+    
+    def _get_children_cached(self, folder_node, cache_key: str) -> List:
+        """Get folder children with caching.
+        
+        Args:
+            folder_node: Folder node object
+            cache_key: Unique key for caching
+            
+        Returns:
+            List of children items
+        """
+        with self._cache_lock:
+            if cache_key in self._folder_cache:
+                return self._folder_cache[cache_key]
+        
+        children = list(folder_node.get_children())
+        
+        with self._cache_lock:
+            self._folder_cache[cache_key] = children
+        
+        return children
     
     def get_drive(self) -> DriveService:
         """Get Drive service.
@@ -64,47 +92,70 @@ class SyncManager:
             raise RuntimeError("iCloud Drive service not available. Please login first.")
         return self.drive
     
-    def list_remote_files(self, folder_name: str = "Documents") -> List[Dict]:
+    def _navigate_to_path(self, path: str):
+        """Navigate to a remote path and return the folder node.
+        
+        Args:
+            path: Path like "Documents/subfolder" or "root" or "Documents"
+            
+        Returns:
+            Folder node or None if not found
+        """
+        drive = self.get_drive()
+        root = drive.root
+        
+        if path == "root" or path == "" or path == "/":
+            return root
+        
+        # Split path into parts
+        parts = [p for p in path.split('/') if p]
+        
+        current = root
+        for part in parts:
+            try:
+                # Try direct access first
+                current = current[part]
+            except (KeyError, Exception):
+                # Try finding in children
+                found = False
+                try:
+                    children = current.get_children()
+                    for item in children:
+                        item_name = getattr(item, 'name', str(item))
+                        item_type = getattr(item, 'type', 'unknown')
+                        if item_name == part and item_type in ("folder", "FOLDER", "folder"):
+                            current = item
+                            found = True
+                            break
+                except Exception as e:
+                    logger.debug(f"Error navigating to {part}: {e}")
+                
+                if not found:
+                    logger.warning(f"Path '{path}' not found at '{part}'")
+                    return None
+        
+        return current
+    
+    def list_remote_files(self, folder_path: str = "root") -> List[Dict]:
         """List files in remote iCloud folder.
         
         Args:
-            folder_name: Name of folder to list (e.g., "Documents", "Desktop")
+            folder_path: Path to folder (e.g., "Documents", "Documents/subfolder", "root")
             
         Returns:
             List of file metadata dictionaries
         """
         drive = self.get_drive()
         try:
-            # Get root folder
-            logger.debug(f"Getting drive root...")
-            root = drive.root
-            
-            # Navigate to requested folder
-            folder = root
-            if folder_name != "root":
-                # Try to find folder using get_children() which returns DriveNode objects
-                logger.debug(f"Getting root children to find folder '{folder_name}'...")
-                children = root.get_children()
-                for item in children:
-                    item_name = getattr(item, 'name', str(item))
-                    item_type = getattr(item, 'type', 'unknown')
-                    if item_name == folder_name and item_type in ("folder", "FOLDER"):
-                        folder = item
-                        break
-                else:
-                    # Try direct access with bracket notation
-                    try:
-                        folder = root[folder_name]
-                    except (KeyError, Exception):
-                        # Folder doesn't exist, return empty list
-                        logger.warning(f"Folder '{folder_name}' not found")
-                        return []
+            # Navigate to the folder
+            folder = self._navigate_to_path(folder_path)
+            if folder is None:
+                return []
             
             files = []
-            # Use get_children() which returns DriveNode objects
-            logger.debug(f"Getting children of folder '{folder_name}'...")
+            logger.debug(f"Getting children of folder '{folder_path}'...")
             children = folder.get_children()
-            logger.debug(f"Found {len(list(children)) if hasattr(children, '__len__') else 'unknown'} children")
+            
             for item in children:
                 item_name = getattr(item, 'name', str(item))
                 item_type = getattr(item, 'type', 'unknown')
@@ -128,57 +179,87 @@ class SyncManager:
             return []
     
     def list_remote_files_recursive(self, folder_name: str = "Documents", 
-                                     prefix: str = "") -> List[Dict]:
-        """List files in remote iCloud folder recursively.
+                                     prefix: str = "",
+                                     show_progress: bool = True) -> List[Dict]:
+        """List files in remote iCloud folder recursively with concurrent scanning.
         
         Args:
             folder_name: Name of folder to list
             prefix: Path prefix for nested items
+            show_progress: Whether to show progress indicator
             
         Returns:
             List of file metadata dictionaries with full paths
         """
         files = []
+        files_lock = threading.Lock()
+        folders_scanned = [0]
+        
         items = self.list_remote_files(folder_name)
+        
+        # Separate files and folders
+        folders_to_scan = []
         
         for item in items:
             item_name = item.get('name', '')
             item_type = item.get('type', 'unknown')
             
-            # Build full path
-            if prefix:
-                full_path = f"{prefix}/{item_name}"
-            else:
-                full_path = item_name
-            
+            full_path = f"{prefix}/{item_name}" if prefix else item_name
             item['path'] = full_path
             files.append(item)
             
-            # Recursively list subdirectories
             if item_type in ('folder', 'FOLDER'):
-                folder_node = item.get('item')
-                if folder_node:
-                    sub_files = self._list_folder_recursive(folder_node, full_path)
+                if item_name not in self.exclude_patterns:
+                    folder_node = item.get('item')
+                    if folder_node:
+                        folders_to_scan.append({
+                            'node': folder_node,
+                            'prefix': full_path
+                        })
+        
+        if folders_to_scan:
+            if show_progress:
+                print(f"  Scanning {len(folders_to_scan)} subfolders concurrently...", end=" ", flush=True)
+            
+            def scan_folder(folder_info):
+                sub_files = self._list_folder_recursive_concurrent(
+                    folder_info['node'], folder_info['prefix'], folders_scanned
+                )
+                with files_lock:
                     files.extend(sub_files)
+            
+            scan_workers = min(self.max_workers, len(folders_to_scan), 8)
+            with ThreadPoolExecutor(max_workers=scan_workers) as executor:
+                list(executor.map(scan_folder, folders_to_scan))
+            
+            if show_progress:
+                print(f"done ({folders_scanned[0]} folders)")
         
         return files
     
-    def _list_folder_recursive(self, folder_node, prefix: str) -> List[Dict]:
-        """Recursively list contents of a folder node.
+    def _list_folder_recursive_concurrent(self, folder_node, prefix: str,
+                                          folders_scanned: List[int] = None) -> List[Dict]:
+        """Recursively list contents of a folder node (concurrent-safe with caching).
         
         Args:
             folder_node: DriveNode folder object
             prefix: Path prefix
+            folders_scanned: Counter for progress
             
         Returns:
             List of file metadata dictionaries
         """
         files = []
         try:
-            children = folder_node.get_children()
+            # Use caching for folder contents
+            children = self._get_children_cached(folder_node, prefix)
+            if folders_scanned is not None:
+                folders_scanned[0] += 1
         except Exception as e:
-            logger.error(f"Error getting children: {e}")
-            return []
+            logger.debug(f"Error listing folder: {e}")
+            return files
+        
+        subfolders = []
         
         for item in children:
             item_name = getattr(item, 'name', str(item))
@@ -188,25 +269,112 @@ class SyncManager:
             
             full_path = f"{prefix}/{item_name}"
             
-            file_info = {
+            files.append({
                 'name': item_name,
                 'path': full_path,
                 'size': getattr(item, 'size', 0),
                 'modified': getattr(item, 'date_modified', None),
                 'type': item_type,
                 'item': item
-            }
-            files.append(file_info)
+            })
             
-            if item_type in ('folder', 'FOLDER'):
-                sub_files = self._list_folder_recursive(item, full_path)
-                files.extend(sub_files)
+            if item_type == 'folder' and item_name not in self.exclude_patterns:
+                subfolders.append({'node': item, 'prefix': full_path})
+        
+        # Process subfolders sequentially within this thread
+        for subfolder in subfolders:
+            sub_files = self._list_folder_recursive_concurrent(
+                subfolder['node'], subfolder['prefix'], folders_scanned
+            )
+            files.extend(sub_files)
         
         return files
     
+    def _list_folder_recursive(self, folder_node, prefix: str) -> List[Dict]:
+        """Legacy method - redirects to concurrent version."""
+        return self._list_folder_recursive_concurrent(folder_node, prefix)
+    
+    def download_single_file(self, remote_path: str, local_path: Optional[Path] = None) -> bool:
+        """Download a single file from iCloud.
+        
+        Args:
+            remote_path: Full remote path like "Documents/subfolder/file.txt"
+            local_path: Local path to save file. Defaults to filename in current directory
+            
+        Returns:
+            True if download successful
+        """
+        try:
+            # Parse the path
+            path_parts = [p for p in remote_path.split('/') if p]
+            if not path_parts:
+                logger.error("Empty remote path")
+                return False
+            
+            filename = path_parts[-1]
+            folder_path = '/'.join(path_parts[:-1]) if len(path_parts) > 1 else "root"
+            
+            # Navigate to parent folder
+            folder = self._navigate_to_path(folder_path)
+            if folder is None:
+                logger.error(f"Folder '{folder_path}' not found")
+                return False
+            
+            # Find the file
+            target_item = None
+            children = folder.get_children()
+            for item in children:
+                item_name = getattr(item, 'name', str(item))
+                if item_name == filename:
+                    target_item = item
+                    break
+            
+            if target_item is None:
+                logger.error(f"File '{filename}' not found in '{folder_path}'")
+                return False
+            
+            # Check if it's a folder
+            item_type = getattr(target_item, 'type', 'unknown')
+            if isinstance(item_type, str):
+                item_type = item_type.lower()
+            
+            if item_type in ('folder',):
+                logger.error(f"'{filename}' is a folder, not a file")
+                return False
+            
+            if item_type in ('app_library', 'app'):
+                logger.error(f"'{filename}' is an app library and cannot be downloaded")
+                return False
+            
+            # Determine local path
+            if local_path is None:
+                local_path = Path.cwd() / filename
+            else:
+                local_path = Path(local_path)
+            
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Download the file
+            if self.download_file(target_item, local_path):
+                # Update state
+                try:
+                    rel_path = str(local_path.relative_to(Path.cwd()))
+                except ValueError:
+                    rel_path = str(local_path)
+                new_hash = State.compute_file_hash(local_path)
+                self.state.set_file_hash(rel_path, new_hash)
+                self.state.set_file_source(rel_path, remote_path)
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.exception(f"Error downloading file '{remote_path}'")
+            return False
+    
     def sync_single_file(self, folder_name: str, filename: str,
                          local_base: Optional[Path] = None) -> bool:
-        """Sync a single file from iCloud.
+        """Sync a single file from iCloud (legacy method, use download_single_file).
         
         Args:
             folder_name: Remote folder name
@@ -216,86 +384,19 @@ class SyncManager:
         Returns:
             True if download successful
         """
+        # Build full remote path
+        if folder_name == "root":
+            remote_path = filename
+        else:
+            remote_path = f"{folder_name}/{filename}"
+        
+        # Determine local path
         if local_base is None:
-            local_base = Path.cwd()
+            local_path = Path.cwd() / filename
+        else:
+            local_path = Path(local_base) / filename
         
-        local_base = Path(local_base)
-        
-        drive = self.get_drive()
-        root = drive.root
-        
-        try:
-            # Navigate to the folder
-            if folder_name == "root":
-                folder = root
-            else:
-                try:
-                    folder = root[folder_name]
-                except (KeyError, Exception):
-                    logger.error(f"Folder '{folder_name}' not found")
-                    return False
-            
-            # Parse filename path (support "subfolder/file.txt" format)
-            path_parts = filename.split('/')
-            target_name = path_parts[-1]
-            subfolder_path = path_parts[:-1]
-            
-            # Navigate through subfolders
-            current_folder = folder
-            for subfolder in subfolder_path:
-                try:
-                    current_folder = current_folder[subfolder]
-                except (KeyError, Exception):
-                    logger.error(f"Subfolder '{subfolder}' not found")
-                    return False
-            
-            # Find the file
-            target_item = None
-            children = current_folder.get_children()
-            for item in children:
-                item_name = getattr(item, 'name', str(item))
-                if item_name == target_name:
-                    target_item = item
-                    break
-            
-            if target_item is None:
-                logger.error(f"File '{filename}' not found in folder")
-                return False
-            
-            # Check if it's a folder
-            item_type = getattr(target_item, 'type', 'unknown')
-            if isinstance(item_type, str):
-                item_type = item_type.lower()
-            
-            if item_type in ('folder', 'FOLDER'):
-                logger.error(f"'{filename}' is a folder, not a file")
-                return False
-            
-            if item_type in ('app_library', 'app'):
-                logger.error(f"'{filename}' is an app library and cannot be downloaded")
-                return False
-            
-            # Create local path (preserve subfolder structure)
-            local_path = local_base / filename
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Download the file
-            if self.download_file(target_item, local_path):
-                # Update state
-                rel_path = str(local_path.relative_to(Path.cwd()))
-                new_hash = State.compute_file_hash(local_path)
-                self.state.set_file_hash(rel_path, new_hash)
-                # Record file source (remote iCloud path)
-                # Always use folder_name/filename format, including for root
-                remote_source = f"{folder_name}/{filename}"
-                self.state.set_file_source(rel_path, remote_source)
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.exception(f"Error syncing file '{filename}'")
-            return False
+        return self.download_single_file(remote_path, local_path)
 
     def download_file(self, remote_item, local_path: Path, max_retries: int = 3,
                        chunk_size: int = DEFAULT_CHUNK_SIZE) -> bool:
@@ -502,7 +603,7 @@ class SyncManager:
     
     def _collect_download_tasks(self, folder_name: str, local_base: Path,
                                  download_tasks: List[Dict]) -> int:
-        """Collect all files that need to be downloaded.
+        """Collect all files that need to be downloaded with concurrent scanning.
         
         Args:
             folder_name: Remote folder name
@@ -514,61 +615,58 @@ class SyncManager:
         """
         import sys
         conflicts_found = 0
-        print(f"  Listing files in '{folder_name}'...", end=" ", flush=True)
+        folders_scanned = [0]  # Use list for mutable counter in nested function
+        tasks_lock = threading.Lock()
+        conflicts_lock = threading.Lock()
+        
+        print(f"  Scanning '{folder_name}'...", end=" ", flush=True)
         remote_files = self.list_remote_files(folder_name)
-        print(f"found {len(remote_files)} items.")
-        sys.stdout.flush()
+        print(f"{len(remote_files)} items")
+        
+        # Separate files and folders
+        files_to_process = []
+        folders_to_scan = []
         
         for file_info in remote_files:
             file_type = file_info['type']
             
-            # Skip app_library types (can't be downloaded)
             if file_type in ('app_library', 'app'):
                 continue
             
             if file_type == 'folder':
-                # Check if folder should be excluded
-                if file_info['name'] in self.exclude_patterns:
-                    print(f"  Skipping excluded folder: {file_info['name']}")
-                    continue
-                    
-                # Recursively collect from subdirectories
-                sub_local = local_base / file_info['name']
-                folder_item = file_info.get('item')
-                if folder_item:
-                    sub_remote_path = f"{folder_name}/{file_info['name']}"
-                    sub_conflicts = self._collect_folder_tasks_recursive(
-                        folder_item, sub_local, sub_remote_path, download_tasks,
-                        current_depth=1
-                    )
-                    conflicts_found += sub_conflicts
-                continue
-            
+                if file_info['name'] not in self.exclude_patterns:
+                    folder_item = file_info.get('item')
+                    if folder_item:
+                        folders_to_scan.append({
+                            'node': folder_item,
+                            'local_base': local_base / file_info['name'],
+                            'remote_path': f"{folder_name}/{file_info['name']}",
+                            'depth': 1
+                        })
+            else:
+                files_to_process.append(file_info)
+        
+        # Process files in current folder
+        for file_info in files_to_process:
             local_path = local_base / file_info['name']
             rel_path = str(local_path.relative_to(Path.cwd()))
             remote_source = f"{folder_name}/{file_info['name']}"
             
-            # Record file source mapping even if file exists
             if not self.state.get_file_source(rel_path):
                 self.state.set_file_source(rel_path, remote_source)
             
-            # Compute remote hash (simplified - use file size and name)
             remote_hash = f"{file_info['name']}_{file_info.get('size', 0)}"
             
-            # Check if file exists locally
             if local_path.exists():
                 local_hash = State.compute_file_hash(local_path)
                 stored_hash = self.state.get_file_hash(rel_path)
                 
-                # Check for conflicts
                 if (stored_hash and local_hash != stored_hash and 
                     self.resolver.detect_conflict(local_path, b"", local_hash, remote_hash)):
                     self.state.add_conflict(rel_path, local_hash, remote_hash)
                     conflicts_found += 1
-                    print(f"Conflict detected: {rel_path}")
                 continue
             
-            # Add to download tasks
             download_tasks.append({
                 'item': file_info['item'],
                 'local_path': local_path,
@@ -576,44 +674,73 @@ class SyncManager:
                 'remote_source': remote_source
             })
         
+        # Concurrent scan of subfolders
+        if folders_to_scan:
+            print(f"  Scanning {len(folders_to_scan)} subfolders concurrently...")
+            
+            def scan_folder(folder_info):
+                """Scan a single folder (thread-safe)."""
+                nonlocal conflicts_found
+                local_tasks = []
+                local_conflicts = self._collect_folder_tasks_concurrent(
+                    folder_info['node'],
+                    folder_info['local_base'],
+                    folder_info['remote_path'],
+                    local_tasks,
+                    folder_info['depth'],
+                    folders_scanned
+                )
+                
+                with tasks_lock:
+                    download_tasks.extend(local_tasks)
+                with conflicts_lock:
+                    nonlocal conflicts_found
+                    conflicts_found += local_conflicts
+            
+            # Use thread pool for concurrent folder scanning
+            scan_workers = min(self.max_workers, len(folders_to_scan), 8)
+            with ThreadPoolExecutor(max_workers=scan_workers) as executor:
+                list(executor.map(scan_folder, folders_to_scan))
+            
+            print(f"  Scanned {folders_scanned[0]} folders total")
+        
         return conflicts_found
     
-    def _collect_folder_tasks_recursive(self, folder_node, local_base: Path,
-                                         remote_path_prefix: str,
-                                         download_tasks: List[Dict],
-                                         current_depth: int = 0) -> int:
-        """Recursively collect download tasks from a folder.
+    def _collect_folder_tasks_concurrent(self, folder_node, local_base: Path,
+                                          remote_path_prefix: str,
+                                          download_tasks: List[Dict],
+                                          current_depth: int = 0,
+                                          folders_scanned: List[int] = None) -> int:
+        """Collect download tasks from a folder (thread-safe version).
         
         Args:
             folder_node: DriveNode folder object
             local_base: Local base directory
-            remote_path_prefix: Remote path prefix for tracking file sources
+            remote_path_prefix: Remote path prefix
             download_tasks: List to append download tasks to
             current_depth: Current recursion depth
+            folders_scanned: Counter for scanned folders
             
         Returns:
             Number of conflicts found
         """
-        # Check max depth
         if self.max_depth > 0 and current_depth > self.max_depth:
-            folder_name = getattr(folder_node, 'name', 'unknown')
-            print(f"  Max depth reached, skipping: {folder_name}")
             return 0
         
         local_base.mkdir(parents=True, exist_ok=True)
         conflicts_found = 0
         
         try:
-            # Show folder being scanned
-            folder_name = getattr(folder_node, 'name', 'unknown')
-            print(f"  Scanning subfolder: {folder_name}...", end=" ", flush=True)
-            children = folder_node.get_children()
-            children_list = list(children)  # Convert to list to get count
-            print(f"found {len(children_list)} items.")
+            # Use caching for folder contents
+            children_list = self._get_children_cached(folder_node, remote_path_prefix)
+            if folders_scanned is not None:
+                folders_scanned[0] += 1
         except Exception as e:
-            logger.error(f"Error getting children of folder: {e}")
-            print(f"error: {e}")
+            logger.debug(f"Error getting children: {e}")
             return 0
+        
+        # Separate files and subfolders
+        subfolders = []
         
         for item in children_list:
             item_name = getattr(item, 'name', str(item))
@@ -621,55 +748,45 @@ class SyncManager:
             if isinstance(item_type, str):
                 item_type = item_type.lower()
             
-            # Skip app_library types
             if item_type in ('app_library', 'app'):
                 continue
             
             if item_type == 'folder':
-                # Check if folder should be excluded
-                if item_name in self.exclude_patterns:
-                    print(f"  Skipping excluded folder: {item_name}")
-                    continue
-                    
-                # Recursively collect from subdirectory
-                sub_local = local_base / item_name
-                sub_remote_path = f"{remote_path_prefix}/{item_name}"
-                sub_conflicts = self._collect_folder_tasks_recursive(
-                    item, sub_local, sub_remote_path, download_tasks,
-                    current_depth=current_depth + 1
-                )
-                conflicts_found += sub_conflicts
+                if item_name not in self.exclude_patterns:
+                    subfolders.append({
+                        'node': item,
+                        'name': item_name
+                    })
                 continue
             
-            # It's a file
+            # Process file
             local_path = local_base / item_name
             try:
                 rel_path = str(local_path.relative_to(Path.cwd()))
             except ValueError:
                 rel_path = str(local_path)
             
-            # Record file source mapping
             remote_source = f"{remote_path_prefix}/{item_name}"
-            if not self.state.get_file_source(rel_path):
-                self.state.set_file_source(rel_path, remote_source)
             
-            # Compute remote hash
+            with self._state_lock:
+                if not self.state.get_file_source(rel_path):
+                    self.state.set_file_source(rel_path, remote_source)
+            
             item_size = getattr(item, 'size', 0)
             remote_hash = f"{item_name}_{item_size}"
             
-            # Check if file exists locally
             if local_path.exists():
                 local_hash = State.compute_file_hash(local_path)
-                stored_hash = self.state.get_file_hash(rel_path)
+                with self._state_lock:
+                    stored_hash = self.state.get_file_hash(rel_path)
                 
                 if (stored_hash and local_hash != stored_hash and 
                     self.resolver.detect_conflict(local_path, b"", local_hash, remote_hash)):
-                    self.state.add_conflict(rel_path, local_hash, remote_hash)
+                    with self._state_lock:
+                        self.state.add_conflict(rel_path, local_hash, remote_hash)
                     conflicts_found += 1
-                    print(f"Conflict detected: {rel_path}")
                 continue
             
-            # Add to download tasks
             download_tasks.append({
                 'item': item,
                 'local_path': local_path,
@@ -677,7 +794,27 @@ class SyncManager:
                 'remote_source': remote_source
             })
         
+        # Recursively process subfolders (sequential within this thread)
+        for subfolder in subfolders:
+            sub_local = local_base / subfolder['name']
+            sub_remote = f"{remote_path_prefix}/{subfolder['name']}"
+            sub_conflicts = self._collect_folder_tasks_concurrent(
+                subfolder['node'], sub_local, sub_remote, download_tasks,
+                current_depth + 1, folders_scanned
+            )
+            conflicts_found += sub_conflicts
+        
         return conflicts_found
+    
+    def _collect_folder_tasks_recursive(self, folder_node, local_base: Path,
+                                         remote_path_prefix: str,
+                                         download_tasks: List[Dict],
+                                         current_depth: int = 0) -> int:
+        """Legacy method - redirects to concurrent version."""
+        return self._collect_folder_tasks_concurrent(
+            folder_node, local_base, remote_path_prefix, 
+            download_tasks, current_depth
+        )
     
     def _download_task(self, remote_item, local_path: Path, 
                        rel_path: str, remote_source: str) -> bool:

@@ -18,17 +18,27 @@ def cli(ctx):
     
     \b
     Quick Start:
-      icloud login -u your@icloud.com   # Login to iCloud
-      icloud sync                        # Download files from Documents
-      icloud list                        # List remote files
+      icloud login -u your@icloud.com    # Login to iCloud
+      icloud list                         # List iCloud Drive root
+      icloud list Documents               # List Documents folder
+      icloud sync -f Documents            # Sync Documents to local
       
     \b
-    Edit & Submit Workflow:
-      icloud add file.txt                # Mark file for upload
-      icloud submit -a                   # Upload all marked files
+    Download Single File:
+      icloud download Documents/file.txt  # Download specific file
       
     \b
-    Common folders: Documents, Desktop, root (iCloud Drive root)
+    Edit & Submit Workflow (like Perforce):
+      icloud checkout file.txt            # Mark file for editing
+      (edit file locally)
+      icloud submit file.txt              # Upload changes
+      icloud submit -a                    # Upload all checked out files
+      
+    \b
+    Other Commands:
+      icloud revert file.txt              # Undo checkout
+      icloud reconcile                    # Scan for local changes
+      icloud info                         # Show status
     """
     ctx.ensure_object(dict)
     ctx.obj['config'] = Config()
@@ -126,8 +136,7 @@ def reconcile(ctx):
 
 @cli.command()
 @click.option('--folder', '-f', default='Documents', 
-              help='Remote folder to sync (default: Documents)')
-@click.option('--file', '-n', 'filename', help='Specific file name to sync (optional)')
+              help='Remote folder path to sync (e.g., Documents, Documents/subfolder)')
 @click.option('--workers', '-w', default=8, type=int,
               help='Number of concurrent workers (default: 8)')
 @click.option('--depth', '-d', default=0, type=int,
@@ -135,28 +144,22 @@ def reconcile(ctx):
 @click.option('--no-exclude', is_flag=True, default=False,
               help='Disable default exclusions (.git, node_modules, etc.)')
 @click.pass_context
-def sync(ctx, folder, filename, workers, depth, no_exclude):
-    """Sync remote files from iCloud.
+def sync(ctx, folder, workers, depth, no_exclude):
+    """Sync remote folder from iCloud to local.
     
     \b
     Examples:
       icloud sync                        # Sync all from Documents
       icloud sync -f Desktop             # Sync from Desktop folder
       icloud sync -f root                # Sync from iCloud Drive root
-      icloud sync -n report.docx         # Sync single file from Documents
-      icloud sync -f root -n data.json   # Sync single file from root
+      icloud sync -f Documents/Projects  # Sync specific subfolder
       icloud sync -w 16                  # Use 16 concurrent workers
       icloud sync -d 2                   # Only scan 2 levels deep
-      icloud sync --no-exclude           # Include .git, node_modules, etc.
     
     \b
     Notes:
-      - Files are downloaded to current directory
-      - Folder structure is preserved
-      - Existing files are skipped (use reconcile to detect changes)
-      - Increase workers (-w) for faster downloads on fast networks
-      - By default skips .git, node_modules, __pycache__ for speed
-      - Use -d to limit depth for faster scanning of large folders
+      - Files downloaded to current directory preserving folder structure
+      - Existing files are skipped (use 'icloud reconcile' to detect changes)
     """
     config = ctx.obj['config']
     state = ctx.obj['state']
@@ -178,40 +181,30 @@ def sync(ctx, folder, filename, workers, depth, no_exclude):
     sync_manager = SyncManager(service, state, config, max_workers=workers,
                                exclude_patterns=exclude_patterns, max_depth=depth)
     
-    if filename:
-        click.echo(f"Syncing file '{filename}' from iCloud folder: {folder}")
-        success = sync_manager.sync_single_file(folder, filename)
-        if success:
-            click.echo(f"Downloaded: {filename}")
-        else:
-            click.echo(f"Failed to download: {filename}", err=True)
-            sys.exit(1)
-    else:
-        depth_info = f", depth: {depth}" if depth > 0 else ""
-        click.echo(f"Syncing from iCloud folder: {folder} (workers: {workers}{depth_info})")
-        files_downloaded, conflicts = sync_manager.sync_from_remote(folder)
-        
-        click.echo(f"Downloaded {files_downloaded} file(s).")
-        if conflicts > 0:
-            click.echo(f"Found {conflicts} conflict(s). Run 'icloud resolve' to resolve them.")
+    depth_info = f", depth: {depth}" if depth > 0 else ""
+    click.echo(f"Syncing from iCloud: {folder} (workers: {workers}{depth_info})")
+    files_downloaded, conflicts = sync_manager.sync_from_remote(folder)
+    
+    click.echo(f"Downloaded {files_downloaded} file(s).")
+    if conflicts > 0:
+        click.echo(f"Found {conflicts} conflict(s). Run 'icloud resolve' to resolve them.")
 
 
 @cli.command('list')
-@click.option('--folder', '-f', default='Documents',
-              help='Remote folder to list (default: Documents)')
+@click.argument('path', default='root', required=False)
 @click.option('--recursive', '-r', is_flag=True, default=False,
               help='List files recursively')
 @click.pass_context
-def list_files(ctx, folder, recursive):
+def list_files(ctx, path, recursive):
     """List files in iCloud Drive.
     
     \b
     Examples:
-      icloud list                        # List Documents folder
-      icloud list -f Desktop             # List Desktop folder
-      icloud list -f root                # List iCloud Drive root
-      icloud list -r                     # List recursively
-      icloud list -f root -r             # List all files from root
+      icloud list                        # List iCloud Drive root
+      icloud list Documents              # List Documents folder
+      icloud list Documents/Projects     # List subfolder
+      icloud list -r                     # List root recursively
+      icloud list Documents -r           # List Documents recursively
     
     \b
     Icons:
@@ -233,23 +226,24 @@ def list_files(ctx, folder, recursive):
     
     sync_manager = SyncManager(service, state, config)
     
-    click.echo(f"Listing files in iCloud folder: {folder}")
+    display_path = path if path != "root" else "iCloud Drive"
+    click.echo(f"📂 {display_path}")
     click.echo("=" * 60)
     
     if recursive:
-        files = sync_manager.list_remote_files_recursive(folder)
+        files = sync_manager.list_remote_files_recursive(path)
     else:
-        files = sync_manager.list_remote_files(folder)
+        files = sync_manager.list_remote_files(path)
     
     if not files:
-        click.echo("No files found.")
+        click.echo("  (empty)")
         return
     
     # Display files
     for file_info in files:
         file_type = file_info.get('type', 'unknown')
         name = file_info.get('name', 'unknown')
-        path = file_info.get('path', name)
+        file_path = file_info.get('path', name)
         size = file_info.get('size', 0)
         
         if file_type in ('folder', 'FOLDER'):
@@ -262,8 +256,8 @@ def list_files(ctx, folder, recursive):
             icon = '📄'
             size_str = f" ({_format_size(size)})" if size else ''
         
-        if recursive and path != name:
-            click.echo(f"  {icon} {path}{size_str}")
+        if recursive and file_path != name:
+            click.echo(f"  {icon} {file_path}{size_str}")
         else:
             click.echo(f"  {icon} {name}{size_str}")
     
@@ -281,6 +275,62 @@ def _format_size(size: int) -> str:
         return f"{size / (1024 * 1024):.1f} MB"
     else:
         return f"{size / (1024 * 1024 * 1024):.1f} GB"
+
+
+@cli.command()
+@click.argument('remote_path')
+@click.argument('local_path', required=False)
+@click.pass_context
+def download(ctx, remote_path, local_path):
+    """Download a single file from iCloud.
+    
+    \b
+    Examples:
+      icloud download Documents/report.pdf           # Download to current dir
+      icloud download Documents/data.json ./data/    # Download to specific dir
+      icloud download Desktop/notes.txt ~/Desktop/   # Download to home Desktop
+    
+    \b
+    Arguments:
+      REMOTE_PATH  Full path in iCloud (e.g., Documents/subfolder/file.txt)
+      LOCAL_PATH   Local destination (optional, defaults to current directory)
+    """
+    config = ctx.obj['config']
+    state = ctx.obj['state']
+    
+    # Check authentication
+    auth = AuthManager(config)
+    if not auth.is_authenticated():
+        click.echo("Not authenticated. Please run 'icloud login' first.", err=True)
+        sys.exit(1)
+    
+    service = auth.get_service()
+    if not service:
+        click.echo("Failed to get iCloud service.", err=True)
+        sys.exit(1)
+    
+    sync_manager = SyncManager(service, state, config)
+    
+    # Determine local path
+    if local_path:
+        local_dest = Path(local_path)
+        if local_dest.is_dir():
+            # If it's a directory, use the filename from remote
+            filename = remote_path.split('/')[-1]
+            local_dest = local_dest / filename
+    else:
+        filename = remote_path.split('/')[-1]
+        local_dest = Path.cwd() / filename
+    
+    click.echo(f"Downloading: {remote_path}")
+    click.echo(f"        To: {local_dest}")
+    
+    success = sync_manager.download_single_file(remote_path, local_dest)
+    if success:
+        click.echo(f"✓ Downloaded successfully")
+    else:
+        click.echo(f"✗ Download failed", err=True)
+        sys.exit(1)
 
 
 @cli.command()
@@ -352,25 +402,39 @@ def resolve(ctx, strategy, file):
 @cli.command()
 @click.argument('files', nargs=-1, type=click.Path(exists=True))
 @click.pass_context
-def add(ctx, files):
-    """Add files to the opened list for submission.
+def checkout(ctx, files):
+    """Mark local files for editing (like Perforce checkout).
     
     \b
     Examples:
-      icloud add file.txt                # Add single file
-      icloud add a.txt b.txt c.txt       # Add multiple files
-      icloud add subfolder/doc.pdf       # Add file in subdirectory
-      icloud add *.txt                   # Add all txt files (shell glob)
+      icloud checkout file.txt           # Checkout single file
+      icloud checkout a.txt b.txt        # Checkout multiple files
+      icloud checkout subfolder/doc.pdf  # Checkout file in subdirectory
+      icloud checkout *.txt              # Checkout all txt files (shell glob)
     
     \b
     Notes:
-      - Added files will be uploaded on next 'icloud submit -a'
-      - Use 'icloud submit' to see current opened files
+      - Checked out files will be uploaded on 'icloud submit'
+      - Use 'icloud submit' to see current checked out files
+      - Use 'icloud revert <file>' to undo checkout
     """
     state = ctx.obj['state']
     
     if not files:
-        click.echo("No files specified. Usage: icloud add <file1> [file2] ...")
+        # Show currently checked out files
+        opened_files = state.get_opened_files()
+        if not opened_files:
+            click.echo("No files checked out.")
+            click.echo("Usage: icloud checkout <file1> [file2] ...")
+            return
+        
+        click.echo(f"Checked out files ({len(opened_files)}):")
+        for f in opened_files:
+            source = state.get_file_source(f)
+            if source:
+                click.echo(f"  📝 {f} <- {source}")
+            else:
+                click.echo(f"  📝 {f} (new file)")
         return
     
     added = 0
@@ -386,68 +450,80 @@ def add(ctx, files):
             rel_path = str(path)
         
         if rel_path in state.get_opened_files():
-            click.echo(f"Already opened: {rel_path}")
+            click.echo(f"Already checked out: {rel_path}")
         else:
             state.add_opened_file(rel_path)
-            click.echo(f"Added: {rel_path}")
+            click.echo(f"✓ Checked out: {rel_path}")
             added += 1
     
     if added > 0:
-        click.echo(f"Added {added} file(s) to opened list.")
+        click.echo(f"\nChecked out {added} file(s). Use 'icloud submit' to upload.")
 
 
 @cli.command()
-@click.option('--folder', '-f', default='Documents',
-              help='Remote folder to upload to (default: Documents)')
-@click.option('--file', '-n', 'filename', help='Specific file to upload (optional)')
-@click.option('--all', '-a', 'upload_all', is_flag=True, default=False,
-              help='Upload all opened files')
+@click.argument('files', nargs=-1, type=click.Path(exists=True))
 @click.pass_context
-def submit(ctx, folder, filename, upload_all):
-    """Upload local changes to iCloud.
+def add(ctx, files):
+    """Alias for 'checkout' - mark files for editing.
     
     \b
     Examples:
-      icloud submit                      # Show opened files list
-      icloud submit -a                   # Upload all opened files
-      icloud submit -n file.txt          # Upload specific file
-      icloud submit -n doc.pdf -f root   # Upload to root (for new files)
+      icloud add file.txt                # Same as 'icloud checkout file.txt'
+    """
+    # Delegate to checkout
+    ctx.invoke(checkout, files=files)
+
+
+@cli.command()
+@click.argument('files', nargs=-1, type=click.Path())
+@click.option('--all', '-a', 'upload_all', is_flag=True, default=False,
+              help='Upload all checked out files')
+@click.option('--folder', '-f', default='Documents',
+              help='Remote folder for new files (default: Documents)')
+@click.pass_context
+def submit(ctx, files, upload_all, folder):
+    """Upload local changes to iCloud (like Perforce submit).
     
     \b
-    Notes:
-      - Files are uploaded to their original iCloud location
-      - The -f option is only used as fallback for new files
-      - Use 'icloud add' to mark files for upload first
+    Examples:
+      icloud submit                      # Show checked out files
+      icloud submit file.txt             # Upload specific file
+      icloud submit a.txt b.txt          # Upload multiple files
+      icloud submit -a                   # Upload all checked out files
+      icloud submit newfile.txt -f root  # Upload new file to root
     
     \b
-    Workflow:
-      1. icloud sync                     # Download files
-      2. (edit files locally)
-      3. icloud add <files>              # Mark for upload
-      4. icloud submit -a                # Upload changes
+    Workflow (Perforce-like):
+      1. icloud sync -f Documents        # Get latest files
+      2. icloud checkout file.txt        # Mark file for editing
+      3. (edit file locally)
+      4. icloud submit file.txt          # Upload changes
+    
+    \b
+    Or submit all at once:
+      icloud submit -a                   # Upload all checked out files
     """
     config = ctx.obj['config']
     state = ctx.obj['state']
     
     opened_files = state.get_opened_files()
     
-    # If no flags specified, just show opened files
-    if not filename and not upload_all:
+    # If no files and no flags specified, just show checked out files
+    if not files and not upload_all:
         if not opened_files:
-            click.echo("No files to submit.")
-            click.echo("Use 'icloud add <file>' to add files, or 'icloud reconcile' to scan for changes.")
+            click.echo("No files checked out.")
+            click.echo("Use 'icloud checkout <file>' to mark files, or 'icloud reconcile' to scan.")
             return
         
-        click.echo(f"Opened files ({len(opened_files)}):")
+        click.echo(f"📋 Checked out files ({len(opened_files)}):")
         for f in opened_files:
-            # Show source path if available
             source = state.get_file_source(f)
             if source:
-                click.echo(f"  📄 {f} -> {source}")
+                click.echo(f"  📝 {f} -> {source}")
             else:
-                click.echo(f"  📄 {f} (new file)")
+                click.echo(f"  📝 {f} (new file)")
         click.echo()
-        click.echo("Use 'icloud submit -a' to upload all, or 'icloud submit -n <file>' to upload specific file.")
+        click.echo("Use 'icloud submit <file>' or 'icloud submit -a' to upload.")
         return
     
     # Check authentication
@@ -463,58 +539,133 @@ def submit(ctx, folder, filename, upload_all):
     
     sync_manager = SyncManager(service, state, config)
     
-    # Handle single file upload
-    if filename:
-        if filename not in opened_files:
-            # Auto-add the file if it exists
+    # Handle specific files
+    if files:
+        success_count = 0
+        fail_count = 0
+        
+        for filename in files:
             file_path = Path(filename)
-            if file_path.exists():
-                state.add_opened_file(filename)
-                click.echo(f"Added {filename} to opened list.")
+            
+            # Check if file exists
+            if not file_path.exists():
+                click.echo(f"✗ File not found: {filename}", err=True)
+                fail_count += 1
+                continue
+            
+            try:
+                rel_path = str(file_path.relative_to(Path.cwd()))
+            except ValueError:
+                rel_path = str(file_path)
+            
+            # Auto-checkout if not already
+            if rel_path not in opened_files:
+                state.add_opened_file(rel_path)
+            
+            # Check if file is in conflict
+            if rel_path in state.get_conflicts():
+                click.echo(f"✗ {rel_path}: has conflicts, resolve first", err=True)
+                fail_count += 1
+                continue
+            
+            # Show destination
+            source = state.get_file_source(rel_path)
+            if source:
+                click.echo(f"Submitting: {rel_path} -> {source}")
             else:
-                click.echo(f"File not found: {filename}", err=True)
-                sys.exit(1)
+                click.echo(f"Submitting: {rel_path} -> {folder}/{rel_path}")
+            
+            success = sync_manager.upload_single_file(rel_path, folder)
+            if success:
+                state.remove_opened_file(rel_path)
+                click.echo(f"✓ Submitted: {rel_path}")
+                success_count += 1
+            else:
+                click.echo(f"✗ Failed: {rel_path}", err=True)
+                fail_count += 1
         
-        # Check if file is in conflict
-        if filename in state.get_conflicts():
-            click.echo(f"File {filename} has conflicts. Please resolve first.", err=True)
-            sys.exit(1)
-        
-        # Show source path if available
-        source = state.get_file_source(filename)
-        if source:
-            click.echo(f"Uploading {filename} -> {source}")
+        click.echo(f"\nSubmitted {success_count} file(s).", nl=False)
+        if fail_count > 0:
+            click.echo(f" ({fail_count} failed)", err=True)
         else:
-            click.echo(f"Uploading {filename} to iCloud folder: {folder}")
-        
-        success = sync_manager.upload_single_file(filename, folder)
-        if success:
-            state.remove_opened_file(filename)
-            click.echo(f"Successfully uploaded: {filename}")
-        else:
-            click.echo(f"Failed to upload: {filename}", err=True)
-            sys.exit(1)
+            click.echo("")
         return
     
-    # Handle upload all opened files
+    # Handle upload all opened files (-a flag)
     if not opened_files:
-        click.echo("No files to submit. Run 'icloud add <file>' or 'icloud reconcile' first.")
+        click.echo("No files to submit.")
         return
     
     # Check for conflicts
     conflicts = state.get_conflicts()
     conflicted_opened = [f for f in opened_files if f in conflicts]
     if conflicted_opened:
-        click.echo(f"Warning: {len(conflicted_opened)} opened file(s) have conflicts:")
+        click.echo(f"⚠️  {len(conflicted_opened)} file(s) have conflicts:")
         for f in conflicted_opened:
-            click.echo(f"  ⚠️  {f}")
-        click.echo("Please resolve conflicts before submitting.")
+            click.echo(f"    {f}")
+        click.echo("Resolve conflicts before submitting.")
         sys.exit(1)
     
-    click.echo(f"Submitting {len(opened_files)} file(s) to iCloud...")
+    click.echo(f"Submitting {len(opened_files)} file(s)...")
     files_uploaded = sync_manager.sync_to_remote(folder)
     
-    click.echo(f"Successfully uploaded {files_uploaded} file(s).")
+    click.echo(f"✓ Submitted {files_uploaded} file(s).")
+
+
+@cli.command()
+@click.argument('files', nargs=-1, type=click.Path())
+@click.option('--all', '-a', 'revert_all', is_flag=True, default=False,
+              help='Revert all checked out files')
+@click.pass_context
+def revert(ctx, files, revert_all):
+    """Revert checked out files (undo checkout).
+    
+    \b
+    Examples:
+      icloud revert file.txt             # Revert single file
+      icloud revert a.txt b.txt          # Revert multiple files
+      icloud revert -a                   # Revert all checked out files
+    
+    \b
+    Notes:
+      - This removes files from the checkout list
+      - Local file changes are NOT reverted (use git or backup)
+      - To restore original file, use 'icloud download'
+    """
+    state = ctx.obj['state']
+    opened_files = state.get_opened_files()
+    
+    if not files and not revert_all:
+        click.echo("Usage: icloud revert <file> or icloud revert -a")
+        return
+    
+    if revert_all:
+        if not opened_files:
+            click.echo("No files to revert.")
+            return
+        
+        count = len(opened_files)
+        for f in list(opened_files):
+            state.remove_opened_file(f)
+        click.echo(f"✓ Reverted {count} file(s).")
+        return
+    
+    reverted = 0
+    for filename in files:
+        try:
+            rel_path = str(Path(filename).relative_to(Path.cwd()))
+        except ValueError:
+            rel_path = str(filename)
+        
+        if rel_path in opened_files:
+            state.remove_opened_file(rel_path)
+            click.echo(f"✓ Reverted: {rel_path}")
+            reverted += 1
+        else:
+            click.echo(f"  Not checked out: {rel_path}")
+    
+    if reverted > 0:
+        click.echo(f"\nReverted {reverted} file(s).")
 
 
 @cli.command()

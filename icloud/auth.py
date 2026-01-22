@@ -274,17 +274,9 @@ class AuthManager:
             self.config.set_username(username)
             self._service = service
             
-            # pyicloud automatically saves session/token, but we ensure it's persisted
-            # The session is saved by pyicloud in its default location
-            # We just need to make sure the service is properly authenticated
-            try:
-                # Verify session is working by accessing a service
-                if hasattr(service, 'drive'):
-                    _ = service.drive
-                logger.info("Session saved and verified")
-            except Exception as e:
-                logger.warning(f"Session verification warning: {e}")
-                # Continue anyway, session might still be valid
+            # pyicloud automatically saves session/token in its default location
+            # Session has already been verified above, no need to verify again
+            logger.info("Session saved successfully")
             
             print("Login successful! Session saved.")
             return True
@@ -372,33 +364,43 @@ class AuthManager:
             saved_china_mainland = self.config.get_china_mainland()
             
             service = None
+            tried_international = False
+            tried_china = False
             
+            # Try saved region preference first (if available)
             if saved_china_mainland is not None:
-                # Try saved region preference first
-                logger.debug(f"Trying saved region preference: {'China mainland' if saved_china_mainland else 'International'}")
+                region_name = 'China mainland' if saved_china_mainland else 'International'
+                logger.debug(f"Trying saved region preference: {region_name}")
                 service = self._try_login_with_region(username, stored_password, cookie_dir, saved_china_mainland)
                 if service and self._verify_service(service):
-                    logger.info(f"Successfully reused saved session with {'China mainland' if saved_china_mainland else 'International'} endpoint")
+                    logger.info(f"Successfully reused saved session with {region_name} endpoint")
                     self._service = service
                     return service
+                # Mark which region we've tried
+                if saved_china_mainland:
+                    tried_china = True
+                else:
+                    tried_international = True
                 service = None
             
-            # Strategy: Try international first, then China mainland
-            logger.debug("Trying international endpoint...")
-            service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=False)
-            if service and self._verify_service(service):
-                logger.info("Successfully reused saved session with International endpoint")
-                self.config.set_china_mainland(False)
-                self._service = service
-                return service
+            # Strategy: Try international first (if not already tried), then China mainland
+            if not tried_international:
+                logger.debug("Trying international endpoint...")
+                service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=False)
+                if service and self._verify_service(service):
+                    logger.info("Successfully reused saved session with International endpoint")
+                    self.config.set_china_mainland(False)
+                    self._service = service
+                    return service
             
-            logger.debug("International failed, trying China mainland endpoint...")
-            service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=True)
-            if service and self._verify_service(service):
-                logger.info("Successfully reused saved session with China mainland endpoint")
-                self.config.set_china_mainland(True)
-                self._service = service
-                return service
+            if not tried_china:
+                logger.debug("Trying China mainland endpoint...")
+                service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=True)
+                if service and self._verify_service(service):
+                    logger.info("Successfully reused saved session with China mainland endpoint")
+                    self.config.set_china_mainland(True)
+                    self._service = service
+                    return service
             
             logger.info("Both endpoints failed, need to re-authenticate")
             return None
