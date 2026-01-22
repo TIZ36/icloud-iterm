@@ -130,4 +130,20 @@ class Config:
         if 'auth' in self._config:
             del self._config['auth']
             self.save()
+    
+    def get_china_mainland(self) -> Optional[bool]:
+        """Get China mainland region preference.
+        
+        Returns:
+            True if using China mainland endpoint, False for international, None if not set
+        """
+        return self.get('auth.china_mainland')
+    
+    def set_china_mainland(self, china_mainland: bool) -> None:
+        """Set China mainland region preference.
+        
+        Args:
+            china_mainland: Whether to use China mainland endpoint
+        """
+        self.set('auth.china_mainland', china_mainland)
 

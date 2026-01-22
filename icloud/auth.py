@@ -63,6 +63,36 @@ class AuthManager:
         self.config = config or Config()
         self._service: Optional[PyiCloudService] = None
     
+    def _try_login_with_region(self, username: str, password: str, cookie_dir: str, china_mainland: bool) -> Optional[PyiCloudService]:
+        """Try to login with specified region setting.
+        
+        Args:
+            username: Apple ID username
+            password: Password
+            cookie_dir: Cookie directory path
+            china_mainland: Whether to use China mainland endpoint
+            
+        Returns:
+            PyiCloudService instance if successful, None otherwise
+        """
+        region_name = "China mainland" if china_mainland else "International"
+        try:
+            logger.debug(f"Attempting {region_name} login for {username}")
+            service = PyiCloudService(
+                username,
+                password,
+                cookie_directory=cookie_dir,
+                china_mainland=china_mainland
+            )
+            logger.info(f"{region_name} login service created successfully")
+            return service
+        except PyiCloudFailedLoginException as e:
+            logger.debug(f"{region_name} login failed: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"{region_name} login error: {e}")
+            return None
+    
     def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
         """Login to iCloud.
         
@@ -83,13 +113,11 @@ class AuthManager:
                 username = input("Apple ID: ").strip()
         
         cookie_dir = get_cookie_directory()
-        china_mainland = is_china_account(username)
-        if china_mainland:
-            logger.info(f"Detected China mainland account: {username}")
         
         try:
             service = None
             need_password = True
+            china_mainland_used = False  # Track which region succeeded
             
             # Check if we have a stored password in keyring
             stored_password = get_password_from_keyring(username)
@@ -99,34 +127,40 @@ class AuthManager:
             
             # Try to create service with stored credentials first
             if password or stored_password:
-                try:
-                    logger.debug(f"Attempting to login with stored/provided password for {username}")
-                    service = PyiCloudService(
-                        username, 
-                        password,
-                        cookie_directory=cookie_dir,
-                        china_mainland=china_mainland
-                    )
+                # Strategy: Try international first, then China mainland
+                logger.info("Trying international login first...")
+                service = self._try_login_with_region(username, password, cookie_dir, china_mainland=False)
+                
+                if service is None:
+                    logger.info("International login failed, trying China mainland...")
+                    service = self._try_login_with_region(username, password, cookie_dir, china_mainland=True)
+                    if service is not None:
+                        china_mainland_used = True
+                
+                if service is not None:
                     need_password = False
-                    logger.info("Service created with password")
-                except PyiCloudFailedLoginException as e:
-                    error_msg = str(e).lower()
-                    if "password" in error_msg or "authentication" in error_msg:
-                        logger.info("Stored password is invalid, need new password")
-                        service = None
-                    else:
-                        raise
+                    logger.info(f"Service created with password ({'China mainland' if china_mainland_used else 'International'})")
             
             # If no service yet, prompt for password
             if service is None:
                 import getpass
                 password = getpass.getpass("Password: ")
-                service = PyiCloudService(
-                    username,
-                    password,
-                    cookie_directory=cookie_dir,
-                    china_mainland=china_mainland
-                )
+                
+                # Strategy: Try international first, then China mainland
+                logger.info("Trying international login first...")
+                service = self._try_login_with_region(username, password, cookie_dir, china_mainland=False)
+                
+                if service is None:
+                    logger.info("International login failed, trying China mainland...")
+                    service = self._try_login_with_region(username, password, cookie_dir, china_mainland=True)
+                    if service is not None:
+                        china_mainland_used = True
+                
+                if service is None:
+                    # Both failed, raise the last error
+                    logger.error("Login failed for both international and China mainland endpoints")
+                    print("Login failed: Unable to authenticate with both international and China mainland endpoints")
+                    return False
                 
                 # Store password in keyring for future use
                 try:
@@ -134,6 +168,9 @@ class AuthManager:
                     logger.info("Password stored in keyring")
                 except Exception as e:
                     logger.warning(f"Could not store password in keyring: {e}")
+            
+            # Save region preference for future use
+            self.config.set_china_mainland(china_mainland_used)
             
             # Handle 2FA if required
             # First, try to detect if 2FA is needed by checking the service
@@ -266,10 +303,41 @@ class AuthManager:
             print(f"Unexpected error during login: {e}")
             return False
     
+    def _verify_service(self, service: PyiCloudService) -> bool:
+        """Verify that a service is valid and can access drive.
+        
+        Args:
+            service: PyiCloudService instance to verify
+            
+        Returns:
+            True if service is valid, False otherwise
+        """
+        # Check if 2FA is required (session expired or invalid)
+        if hasattr(service, 'requires_2fa') and service.requires_2fa:
+            logger.debug("2FA required, session expired or invalid")
+            return False
+        if hasattr(service, 'requires_2sa') and service.requires_2sa:
+            logger.debug("2SA required, session expired or invalid")
+            return False
+        
+        # Verify authentication by trying to access a service
+        try:
+            if hasattr(service, 'drive'):
+                _ = service.drive
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            if "421" in error_msg or "Authentication required" in error_msg:
+                logger.debug("Session expired or authentication required")
+            else:
+                logger.debug(f"Service access failed: {e}")
+            return False
+    
     def get_service(self) -> Optional[PyiCloudService]:
         """Get authenticated PyiCloudService instance.
         
         Tries to reuse saved session/token. If session is invalid, returns None.
+        Uses saved region preference, or tries international first then China mainland.
         
         Returns:
             PyiCloudService instance or None if not authenticated
@@ -292,7 +360,6 @@ class AuthManager:
             return None
         
         cookie_dir = get_cookie_directory()
-        china_mainland = is_china_account(username)
         
         try:
             # Try to get password from keyring
@@ -301,39 +368,40 @@ class AuthManager:
                 logger.info("No stored password in keyring, need to re-authenticate")
                 return None
             
-            # Try to create service with stored credentials
-            logger.debug(f"Attempting to reuse session for {username}")
-            service = PyiCloudService(
-                username,
-                stored_password,
-                cookie_directory=cookie_dir,
-                china_mainland=china_mainland
-            )
+            # Check for saved region preference
+            saved_china_mainland = self.config.get_china_mainland()
             
-            # Check if 2FA is required (session expired or invalid)
-            if hasattr(service, 'requires_2fa') and service.requires_2fa:
-                logger.info("2FA required, session expired or invalid")
-                return None
-            if hasattr(service, 'requires_2sa') and service.requires_2sa:
-                logger.info("2SA required, session expired or invalid")
-                return None
+            service = None
             
-            # Verify authentication by trying to access a service
-            try:
-                if hasattr(service, 'drive'):
-                    _ = service.drive
-                # If we can access drive, session is valid
-                logger.info("Successfully reused saved session")
+            if saved_china_mainland is not None:
+                # Try saved region preference first
+                logger.debug(f"Trying saved region preference: {'China mainland' if saved_china_mainland else 'International'}")
+                service = self._try_login_with_region(username, stored_password, cookie_dir, saved_china_mainland)
+                if service and self._verify_service(service):
+                    logger.info(f"Successfully reused saved session with {'China mainland' if saved_china_mainland else 'International'} endpoint")
+                    self._service = service
+                    return service
+                service = None
+            
+            # Strategy: Try international first, then China mainland
+            logger.debug("Trying international endpoint...")
+            service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=False)
+            if service and self._verify_service(service):
+                logger.info("Successfully reused saved session with International endpoint")
+                self.config.set_china_mainland(False)
                 self._service = service
                 return service
-            except Exception as e:
-                error_msg = str(e)
-                if "421" in error_msg or "Authentication required" in error_msg:
-                    logger.info("Session expired, need to re-authenticate")
-                    return None
-                # Other errors might be temporary, but we'll require re-auth to be safe
-                logger.warning(f"Service access failed: {e}")
-                return None
+            
+            logger.debug("International failed, trying China mainland endpoint...")
+            service = self._try_login_with_region(username, stored_password, cookie_dir, china_mainland=True)
+            if service and self._verify_service(service):
+                logger.info("Successfully reused saved session with China mainland endpoint")
+                self.config.set_china_mainland(True)
+                self._service = service
+                return service
+            
+            logger.info("Both endpoints failed, need to re-authenticate")
+            return None
                 
         except PyiCloudFailedLoginException:
             logger.info("Saved session invalid, need to re-authenticate")
